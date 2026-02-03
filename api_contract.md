@@ -1,337 +1,319 @@
-POST /api/products
+## Database Design
+
+### Product Architecture Overview
+
+The product service uses a **Product-Variant architecture** that separates product metadata from actual sellable units. This design enables:
+
+1. **Single product with multiple variations** (e.g., a T-shirt in different sizes/colors)
+2. **Independent inventory tracking per variant**
+3. **Flexible pricing models per product** (fixed or tiered)
+4. **Granular stock and availability management**
+
+```
+┌─────────────────┐
+│     Product     │  ← Metadata (name, description, category, brand)
+│  (Parent Entity)│
+└────────┬────────┘
+         │ 1:N
+         ▼
+┌─────────────────┐
+│ ProductVariant  │  ← Actual sellable unit with attributes
+│ (Sellable Unit) │
+└────────┬────────┘
+         │ 1:1
+         ▼
+┌─────────────────┐     ┌─────────────────┐
+│   FixedPrice    │ OR  │   TieredPrice   │  ← Pricing (mutually exclusive)
+└─────────────────┘     └─────────────────┘
+         │                       │
+         └───────────┬───────────┘
+                     ▼
+              ┌─────────────────┐
+              │    Inventory    │  ← Stock management
+              └─────────────────┘
+```
+
+### Product Model (Metadata)
+
+The **Product** model represents product metadata - shared information that applies to all variants of a product. It is **NOT** directly purchasable; customers purchase **variants**.
+
+#### Product Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `name` | CharField(255) | Product name |
+| `description` | TextField | Product description |
+| `category` | ForeignKey | Reference to Category (defaults to "Miscellaneous") |
+| `brand` | ForeignKey | Reference to Brand (defaults to "Generic") |
+| `pricing_model` | CharField | `fixed` or `tiered` - applies to ALL variants (defaults to 'fixed') |
+| `sale_type` | CharField | `wholesale` or `retail` (defaults to retail)|
+| `vendor_id` | UUID | Reference to vendor |
+| `business_name` | CharField | Vendor's business name (denormalized) |
+| `status` | CharField | `draft`, `active`, `inactive` (defaults to draft) |
+
+#### Product Status Values
+
+| Status | Description |
+|--------|-------------|
+| `draft` | Product is being created, not visible to customers |
+| `active` | Product is live and can be displayed (if has sellable variants) |
+| `inactive` | Product is temporarily hidden |
+| `discontinued` | Product is soft-deleted, not retrievable by vendors **(not to be shown on frontend, backend only)** |
+
+#### Key Product Properties
+
+- **`is_available`**: Returns `True` only if product status is `active` AND has at least one sellable variant
+- **`is_on_sale`**: Returns `True` if any variant is currently on sale
+- **`price`**: Display-only property showing the lowest current price among variants
+- **`moq`**: Display-only property showing the minimum order quantity
+
+### ProductVariant Model (Sellable Units)
+
+The **ProductVariant** model represents the actual sellable unit. Each variant has unique attributes (e.g., size: "Large", color: "Blue") and its own inventory, pricing, and images.
+
+#### Variant Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `product` | ForeignKey | Parent product |
+| `attributes` | JSONField | Key-value pairs defining the variant (e.g., `{"size": "large", "color": "blue"}`) |
+| `condition` | CharField | `new`, `slightly used`, `used` |
+| `attribute_signature` | CharField | Computed hash of normalized attributes (for uniqueness) |
+| `vendor_id` | UUID | Inherited from product |
+| `sku` | CharField(100) | Stock Keeping Unit (unique per vendor) |
+| `status` | CharField | `active`, `inactive` (defaults to inactive) |
+
+#### Variant Status Values
+
+| Status | Description |
+|--------|-------------|
+| `active` | Variant is available for purchase (requires valid pricing and inventory) |
+| `inactive` | Variant is temporarily unavailable |
+| `discontinued` | Variant is soft-deleted |
+
+#### Key Variant Properties
+
+- **`is_sellable`**: Returns `True` if variant has:
+  - Status = `active`
+  - Valid pricing (FixedPrice or TieredPrice)
+  - Stock >= minimum_order_quantity
+  
+- **`is_in_stock`**: Returns `True` if stock >= minimum_order_quantity
+
+- **`is_low_stock`**: Returns `True` if stock <= 2 × minimum_order_quantity
+
+- **`is_on_sale`**: Returns `True` if variant is active, in stock, and has a sale price set
+
+- **`price`**: 
+  - For fixed pricing: Returns `current_price`
+  - For tiered pricing: Returns price range (e.g., "10.00 - 8.00")
+
+#### Variant Uniqueness Constraints
+
+1. **Unique attributes per product per vendor**: No two variants under the same product can have identical attributes
+2. **Unique SKU per vendor**: Each vendor must use unique SKUs across all their variants
+
+### Pricing Models
+
+The product service supports two mutually exclusive pricing models. The `pricing_model` is set at the **Product level** and applies to ALL variants under that product.
+
+> **Important**: Once a product has variants with prices, the pricing model CANNOT be changed.
+
+#### Fixed Price Model
+
+Used for standard retail pricing with a single price point.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `variant` | OneToOne | Reference to ProductVariant (primary key) |
+| `base_price` | Decimal(10,2) | Original price |
+| `sale_price` | Decimal(10,2) | Optional discounted price |
+
+**Computed Properties:**
+- `current_price`: Returns `sale_price` if set, otherwise `base_price`
+- `is_on_sale`: True if `sale_price` exists and is less than `base_price`
+- `discount_percentage`: Calculated discount if on sale
+
+**Example:**
+```json
+{
+  "fixed_price": {
+    "base_price": "99.99",
+    "sale_price": "79.99",
+    "current_price": "79.99",
+    "is_on_sale": true,
+    "discount_percentage": "20.01"
+  }
+}
+```
+
+#### Tiered Price Model
+
+Used for wholesale/bulk pricing where price per unit decreases with quantity.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `variant` | ForeignKey | Reference to ProductVariant |
+| `min_quantity` | PositiveInt | Minimum quantity for this tier |
+| `max_quantity` | PositiveInt | Maximum quantity for this tier |
+| `base_price_per_unit` | Decimal(10,2) | Original price per unit |
+| `sale_price_per_unit` | Decimal(10,2) | Optional discounted price per unit |
+
+**Tier Rules:**
+1. Tiers must be **contiguous** - no gaps between ranges
+2. First tier must start at the variant's MOQ (minimum_order_quantity)
+3. Tiers cannot **overlap**
+4. Different tiers must have different base prices
+5. `min_quantity` must be less than `max_quantity`
+
+**Example:**
+```json
+{
+  "tiered_price": [
+    {
+      "id": "tier-uuid-1",
+      "min_quantity": 10,
+      "max_quantity": 49,
+      "base_price_per_unit": "15.00",
+      "sale_price_per_unit": null,
+      "current_price_per_unit": "15.00",
+      "is_on_sale": false,
+      "discount_percentage": 0
+    },
+    {
+      "id": "tier-uuid-2",
+      "min_quantity": 50,
+      "max_quantity": 99,
+      "base_price_per_unit": "12.00",
+      "sale_price_per_unit": "10.00",
+      "current_price_per_unit": "10.00",
+      "is_on_sale": true,
+      "discount_percentage": "16.67"
+    },
+    {
+      "id": "tier-uuid-3",
+      "min_quantity": 100,
+      "max_quantity": 500,
+      "base_price_per_unit": "9.00",
+      "sale_price_per_unit": null,
+      "current_price_per_unit": "9.00",
+      "is_on_sale": false,
+      "discount_percentage": 0
+    }
+  ]
+}
+```
+
+### Inventory Management
+
+Each variant has a one-to-one relationship with an Inventory record.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `variant` | OneToOne | Reference to ProductVariant (primary key) |
+| `stock` | PositiveInt | Current stock quantity |
+| `minimum_order_quantity` | PositiveInt | Minimum units that can be ordered (MOQ) |
+| `low_stock_threshold` | PositiveInt | Alert threshold for low stock |
+| `track_inventory` | Boolean | Whether to track inventory for this variant |
+
+**Constraint**: `low_stock_threshold` must be >= `minimum_order_quantity`
+
+**Stock Status Logic:**
+- **In Stock**: `stock >= minimum_order_quantity`
+- **Low Stock**: `stock <= (2 × minimum_order_quantity)`
+- **Out of Stock**: `stock < minimum_order_quantity`
+
+### Validation Logic
+
+The product service implements validation at multiple layers for data integrity.
+
+#### Model-Level Validation (models.py)
+
+**Product Model:**
+- Cannot change `pricing_model` after variants with prices exist
+
+**ProductVariant Model:**
+- `attributes` must be a JSON object with string keys and values
+- Attributes are normalized (lowercase, trimmed) before storage
+- Unique constraint: No duplicate `(vendor_id, product, attribute_signature)` combinations
+- Unique constraint: No duplicate `(vendor_id, sku)` combinations
+
+**FixedPrice Model:**
+- `base_price` must be a Decimal > 0 if variant is active
+- Cannot create FixedPrice if product's pricing_model is `tiered`
+- Cannot have both FixedPrice and TieredPrice for same variant
+- `sale_price` cannot exceed `base_price`
+
+**TieredPrice Model:**
+- `base_price_per_unit` must be a Decimal > 0 if variant is active
+- Cannot create TieredPrice if product's pricing_model is `fixed`
+- Price ranges cannot overlap
+- Tiers must be contiguous (start at MOQ, each tier starts where previous ended)
+- Different tiers must have different base prices
+- `min_quantity` must be >= variant's MOQ
+- `sale_price_per_unit` cannot exceed `base_price_per_unit`
+
+**Inventory Model:**
+- `low_stock_threshold` cannot be lower than `minimum_order_quantity`
+- Cannot set MOQ lower than existing tier minimum quantities
+
+#### Serializer-Level Validation (serializers.py)
+
+**ProductVariantSerializer Validation:**
+```
+If status == 'active':
+  ├── inventory is REQUIRED
+  │   ├── stock must be > 0
+  │   ├── minimum_order_quantity must be > 0
+  │   ├── moq cannot exceed stock
+  │   └── low_stock_threshold must be >= moq
+  │
+  ├── exactly ONE pricing model required (fixed OR tiered, not both)
+  │
+  └── For tiered pricing:
+      ├── min_quantity >= moq
+      ├── max_quantity <= stock
+      └── min_quantity < max_quantity
+```
+
+**ProductCreateSerializer Validation:**
+- Images are required
+- If status == `active`, variants are required
+- Vendor must have completed their storefront profile
+- HTML content is sanitized using bleach
+
+**CreateReviewSerializer Validation:**
+- User must be authenticated
+- User can only submit one review per product
+
 ---
-**Description**
-Creates a new product with all its associated data including images, attributes, and variants.
-
-**Frontend usage**
-Can be used by vendors or administrators to add new products to the catalog. Supports creating products with multiple variants, images, and attributes in a single request.
-
-- URL Parameters
-  - None
-
-- Available Query Parameters
-  - None
-
-- Headers
-  - `Content-Type: application/json`
-
-- Data Parameters
-```json
-{
-  "name": "Men's 100% Cotton Casual Crew Neck T-Shirt",
-  "sku": "BEA-ESS-ESS-001",
-  "description": "Men's 100% Cotton Casual Crew Neck T-Shirt - Regular Fit Short Sleeve with Milano Italy Letter Print, Breathable All-Season Comfort",
-  "general_features": {
-    "Sheer": "No",
-    "Fabric": "Slight stretch",
-    "Season": "Summer",
-    "Pattern": "Print",
-    "Sleeve Type": "Regular Sleeve",
-    "Collar Style": "Crew Neck",
-    "Sleeve Length": "Short Sleeve",
-    "Weaving method": "Knit Fabric"
-  },
-  "category": "mens-shirts",
-  "brand": "milano",
-  "base_price": "100.89",
-  "sale_price": "78.22",
-  "cost_price": "50.00",
-  "stock": 20,
-  "low_stock_threshold": 10,
-  "track_inventory": true,
-  "status": "active",
-  "weight": null,
-  "length": null,
-  "width": null,
-  "height": null,
-  "images": [
-    {
-      "image": "https://img.kwcdn.com/product/fancy/market/be2dcfae82ee1d0164d6ec6a4123bc5c_tHjErIfrHqVkI.jpg",
-      "alt_text": "Primary product image",
-      "is_primary": true
-    },
-    {
-      "image": "https://img.kwcdn.com/product/open/7d2f3d6e2c034dfdb4a3e94033a95919-goods.jpeg",
-      "alt_text": "Alternative product view",
-      "is_primary": false
-    }
-  ],
-  "attributes": [
-    {
-      "attribute": "color",
-      "value": "white"
-    },
-    {
-      "attribute": "size", 
-      "value": "small"
-    }
-  ],
-  "variants": [
-    {
-      "sku": "BEA-ESS-ESS-002",
-      "name": "Men's 100% Cotton Casual Crew Neck T-Shirt - Medium White",
-      "price": "100.89",
-      "sale_price": "78.53",
-      "stock": 12,
-      "track_inventory": true,
-      "is_active": true,
-      "weight": null,
-      "variant_attributes": [
-        {
-          "attribute": "color",
-          "value": "white"
-        },
-        {
-          "attribute": "size",
-          "value": "m"
-        }
-      ],
-      "images": [
-        {
-          "image": "https://img.kwcdn.com/product/fancy/market/be2dcfae82ee1d0164d6ec6a4123bc5c_tHjErIfrHqVkI.jpg",
-          "alt_text": "White medium variant",
-          "is_primary": true
-        }
-      ]
-    }
-  ]
-}
-```
-
-- **Required Fields**
-  - `name`: Product name (string)
-  - `sku`: Stock Keeping Unit (string, max 100 chars)
-  - `description`: Product description (text)
-  - `base_price`: Base price (decimal, max 10 digits, 2 decimal places)
-  - `images`: Array of product images (at least one required)
-
-- **Optional Fields**
-  - `general_features`: JSON object for general product features
-  - `category`: Category slug (string, references existing category), defaults to `miscellaneous` if not provided
-  - `brand`: Brand slug (string, references existing brand), defaults to `generic` if not provided
-  - `sale_price`: Sale/discounted price (decimal). Product would go on sale if `sale_price` is provided and is lower than `base_price`.
-  - `cost_price`: Cost to vendor (decimal)
-  - `stock`: Stock quantity (integer, default 0)
-  - `low_stock_threshold`: Minimum stock alert level (integer, default 10)
-  - `track_inventory`: Whether to track inventory (boolean, default true)
-  - `status`: Product status (`active`, `inactive`, `draft`, `discontinued`, default `draft`)
-  - `weight`: Product weight (decimal)
-  - `length`: Product length (decimal)
-  - `width`: Product width (decimal)  
-  - `height`: Product height (decimal)
-  - `attributes`: Array of product attributes
-  - `variants`: Array of product variants
-
-**Images field**
-- **Required fields**
-  - `image`: Image url
-- **Optional fields**
-  - `is_primary`: Specifies which image would be used as the thumbnail (boolean, default false). Should only be true for one image.
-  - `alt_text`: Text describing the image.
 
 
-**Variant fields**
-- **Required fields**
-  - `sku`: Stock Keeping Unit (string, max 100 chars)
-  - `variant_attributes`: Array of variant's attributes
-  - `images`: Array of variants images
-- **Optional fields**
-  - `name`: Variant's name
-  - `price`: Variant's base price (decimal, max 10 digits, 2 decimal places), uses main product's `base_price` if not provided.
-  - `sale_price`: Variant's sale/discounted price (decimal), uses main product's `sale_price` if not provided.
-  - `stock`: Stock quantity (integer, default 0), uses main product's `stock` if not provided.
-  - `is_active`: Variants status (boolean, default true)
-  - `track_inventory`: Whether to track inventory (boolean, default true)
+## Notes
 
-**Validation Rules**
-  - If `status` is `active`, `stock` must be greater than 0
-  - `category` must reference an existing category slug
-  - `brand` must reference an existing brand slug
-  - Each image in `images` array must have `image` URL
-  - Variant attributes must be valid attribute-value pairs
-  - For variants, `stock` must be greater than 0 if `is_active` is true.
+### Products vs Variants
+- **Products** hold shared metadata (name, description, category, brand, images)
+- **Variants** are the actual purchasable items with specific attributes, pricing, and inventory
+- Customers purchase **variants**, not products directly
 
-**Explaining pricing**
-- `cost_price`: the amount of money it costs the vendor to produce or acquire the product
-- `base_price`: the starting selling price before discounts, taxes, or promotional adjustments
-- `sale_price`: (a.k.a. selling price) the price the customer actually pays after:
-  - discounts
-  - coupons
-  - seasonal promotions
-  - flash sales
-  - clearance markdowns
-- If there are no discounts, then `sale_price` == `base_price`
+### Pricing Model Immutability
+- Once a product has variants with prices attached, the pricing model cannot be changed
+- All variants under a product must use the same pricing model (fixed OR tiered)
 
-**Example**
-- you buy a pair of knock off sneakers from a supplier in kanta.
-  - `cost_price` = ₵60
-- you want 100% profit margin on that
-  - `base_price` = ₵120
-- you are running a 20% off summer sale
-  - `base_price` = ₵120
-  - `discount` = 20% = ₵24
-  - `sale_price` = ₵120 - ₵24 = ₵96
+### Soft Delete Pattern
+- Products and variants are not permanently deleted
+- Status is set to `discontinued` which hides them from vendor views
+- Admin can still see all products/variants regardless of status
 
-**Explaining Variation**:
-- If the product has a property/attribute that would cause it to have a variation, that property/attribute is stored in the ProductAttribute model (in the case of the API, that would be the `attributes` array/section of the product)
-- When creating the variants, the attribute/property of the product which varies to cause the variant is stored in the VariantAttribute model (in the case of the API, that would be the `variant_attributes` array/section of the product's variant) for that specific variant.
-- A product's `attributes` are properties/attributes that vary accross variants (e.g., color, size, RAM, cpu speed, etc).
-- A product's variants are specific combinations of those variable `attributes`.
-- `variant_attributes` are the actual properties/attributes of that variant which causes it to differ from the main product.
-- *NB*: `attributes` is only used when a product has a variation.
+### Stock and Availability
+- A variant is "in stock" when `stock >= minimum_order_quantity`
+- A product is "available" when it's active AND has at least one sellable variant
+- Sellable = active status + valid pricing + sufficient stock
 
-**Example**:
-- If a vendor is selling two Stanley cups of varying colors, red and white, with the red cup being his main product.
-- the `attributes` sectiton of the product is populated with the *red* attribute, with its accompanying data.
-- a variant is created with its `variant_attribute` populated with the *white* attribute, with its accompanying data.
-- POST request then becomes:
-  ```json
-  {
-      "name": "Stanley Quencher H2.0 Tumbler",
-      "base_price": "...",
-      "general_features": "...",
-      "attributes": [
-        {
-          "attribute": "color",
-          "value": "red"
-        }
-      ],
-      "variants": [
-        {
-          "name": "...",
-          "price": "...",
-          "variant_attributes": [
-            {
-              "attribute": "color",
-              "value": "white"
-            }
-          ]
-        }
-      ]
-  ```
-
-- **Success Response**
-  - `201 Created`: Product created successfully
-
-```json
-{
-  "id": "77b44a6a-1c22-40a2-99a1-0b073ffa488b",
-  "name": "Men's 100% Cotton Casual Crew Neck T-Shirt",
-  "sku": "BEA-ESS-ESS-001",
-  "description": "Men's 100% Cotton Casual Crew Neck T-Shirt - Regular Fit Short Sleeve with Milano Italy Letter Print, Breathable All-Season Comfort",
-  "general_features": {
-    "Sheer": "No",
-    "Fabric": "Slight stretch",
-    "Season": "Summer",
-    "Pattern": "Print",
-    "Sleeve Type": "Regular Sleeve",
-    "Collar Style": "Crew Neck",
-    "Sleeve Length": "Short Sleeve",
-    "Weaving method": "Knit Fabric"
-  },
-  "category": "mens-shirts",
-  "brand": "milano",
-  "vendor": "77b44a6a-1c22-40a2-99a1-0b073ffa488b",
-  "base_price": "100.89",
-  "sale_price": "78.22",
-  "cost_price": "50.00",
-  "stock": 20,
-  "low_stock_threshold": 10,
-  "track_inventory": true,
-  "status": "active",
-  "weight": null,
-  "length": null,
-  "width": null,
-  "height": null,
-  "images": [
-    {
-      "id": "c16f71bf-9810-4026-bb9e-1f0922f7b718",
-      "image": "https://img.kwcdn.com/product/fancy/market/be2dcfae82ee1d0164d6ec6a4123bc5c_tHjErIfrHqVkI.jpg",
-      "alt_text": "Primary product image",
-      "is_primary": true,
-      "created_at": "2025-08-03T21:21:09.025422Z",
-      "updated_at": "2025-08-03T21:21:09.025422Z"
-    },
-    {
-      "id": "fe856ea7-94d6-4ace-8863-35f6f24a1dae",
-      "image": "https://img.kwcdn.com/product/open/7d2f3d6e2c034dfdb4a3e94033a95919-goods.jpeg",
-      "alt_text": "Alternative product view",
-      "is_primary": false,
-      "created_at": "2025-08-03T21:21:09.021015Z",
-      "updated_at": "2025-08-03T21:21:09.021015Z"
-    }
-  ],
-  "attributes": [
-    {
-      "id": "32bb1058-7141-4bf4-b469-623d7a89afb7",
-      "attribute": "color",
-      "value": "white",
-      "created_at": "2025-08-03T21:21:09.015600Z",
-      "updated_at": "2025-08-03T21:21:09.015600Z"
-    },
-    {
-      "id": "5d5a7791-c497-428a-a4c6-27ab666fba0b",
-      "attribute": "size",
-      "value": "small", 
-      "created_at": "2025-08-03T21:21:09.015600Z",
-      "updated_at": "2025-08-03T21:21:09.015600Z"
-    }
-  ],
-  "variants": [
-    {
-      "id": "2688442f-f216-45ad-bae0-58ea3d81e293",
-      "sku": "BEA-ESS-ESS-002",
-      "name": "Men's 100% Cotton Casual Crew Neck T-Shirt - Medium White",
-      "price": "100.89",
-      "sale_price": "78.53",
-      "current_price": "78.53",
-      "stock": 12,
-      "track_inventory": true,
-      "is_in_stock": true,
-      "weight": null,
-      "dimensions": null,
-      "is_active": true,
-      "variant_attributes": [
-        {
-          "id": "ca85444c-f5f6-4322-b76c-fd58f69d79d0",
-          "attribute": "color",
-          "value": "white",
-          "created_at": "2025-08-03T21:21:09.029101Z",
-          "updated_at": "2025-08-03T21:21:09.029101Z"
-        },
-        {
-          "id": "b585afae-752f-46a7-b983-b3ee5b7a788d",
-          "attribute": "size",
-          "value": "m",
-          "created_at": "2025-08-03T21:21:09.033036Z",
-          "updated_at": "2025-08-03T21:21:09.033036Z"
-        }
-      ],
-      "images": [
-        {
-          "id": "abc12345-1234-5678-9012-123456789012",
-          "image": "https://img.kwcdn.com/product/fancy/market/be2dcfae82ee1d0164d6ec6a4123bc5c_tHjErIfrHqVkI.jpg",
-          "alt_text": "White medium variant",
-          "is_primary": true,
-          "created_at": "2025-08-03T21:21:09.025422Z",
-          "updated_at": "2025-08-03T21:21:09.025422Z"
-        }
-      ],
-      "created_at": "2025-08-03T21:21:09.025422Z",
-      "updated_at": "2025-08-03T21:21:09.025422Z"
-    }
-  ]
-}
-```
-
-**Error Responses**
-- `400 Bad Request`: Invalid input, validation errors, or missing required fields
-
-```json
-{
-  "stock": ["Stock must be greater than one if status is active"],
-  "category": ["Invalid slug 'invalid-category' - object does not exist."],
-  "base_price": ["This field is required."],
-  "images": ["This field is required."]
-}
-```
+### HTML Sanitization
+- Product names, descriptions, and alt text are sanitized using bleach
+- Allowed tags: `b`, `i`, `u`, `em`, `strong`, `a`, `p`, `ul`, `li`, `br`
+- All other HTML is stripped
