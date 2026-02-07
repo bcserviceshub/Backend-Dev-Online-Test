@@ -1,5 +1,3 @@
-## Database Design
-
 ### Product Architecture Overview
 
 The product service uses a **Product-Variant architecture** that separates product metadata from actual sellable units. This design enables:
@@ -68,6 +66,12 @@ The **Product** model represents product metadata - shared information that appl
 - **`price`**: Display-only property showing the lowest current price among variants
 - **`moq`**: Display-only property showing the minimum order quantity
 
+#### Product Unique Constraints
+
+1. **Unique name sale_type, status per vendor**: No two products of a vendor with the same name, and sale_type should have identical statuses.
+   -  and yes, that means a vendor can have two active products with the same name, as long as they don't have the same sale_type.
+   -  *a vendor's products' shouldn't have an identical combination of (name, sale_type and status), every other combination is fine*
+
 ### ProductVariant Model (Sellable Units)
 
 The **ProductVariant** model represents the actual sellable unit. Each variant has unique attributes (e.g., size: "Large", color: "Blue") and its own inventory, pricing, and images.
@@ -112,14 +116,20 @@ The **ProductVariant** model represents the actual sellable unit. Each variant h
 
 #### Variant Uniqueness Constraints
 
-1. **Unique attributes per product per vendor**: No two variants under the same product can have identical attributes
+1. **Unique attributes per product per vendor**: No two variants under the same product can have identical attributes and status
+   - *a vendor's product's variant should not have an identical combination of (attributes and status) every other combo is fine*
 2. **Unique SKU per vendor**: Each vendor must use unique SKUs across all their variants
+   - *a vendor's variant should not have an identical combination of (sku and status), every other combination is fine*
 
 ### Pricing Models
 
 The product service supports two mutually exclusive pricing models. The `pricing_model` is set at the **Product level** and applies to ALL variants under that product.
 
-> **Important**: Once a product has variants with prices, the pricing model CANNOT be changed.
+> **Important**:
+> - Once a product has variants with prices, the pricing model CANNOT be changed directly.
+> - For a vendor to change a product's pricing model, it's variants should be deleted before making the change.
+> - A deleted (`discontinued`) variant cannot be reactivated (set to `active`), even by admin, as doing so would cause an inconsistency.
+> - A vendor can have multiple variants under a product with the same sku/attributes, as long as their statuses are not the same.
 
 #### Fixed Price Model
 
@@ -238,8 +248,8 @@ The product service implements validation at multiple layers for data integrity.
 **ProductVariant Model:**
 - `attributes` must be a JSON object with string keys and values
 - Attributes are normalized (lowercase, trimmed) before storage
-- Unique constraint: No duplicate `(vendor_id, product, attribute_signature)` combinations
-- Unique constraint: No duplicate `(vendor_id, sku)` combinations
+- Unique constraint: No duplicate `(vendor_id, product, attribute_signature, status)` combinations
+- Unique constraint: No duplicate `(vendor_id, sku, status)` combinations
 
 **FixedPrice Model:**
 - `base_price` must be a Decimal > 0 if variant is active
@@ -307,6 +317,7 @@ If status == 'active':
 - Products and variants are not permanently deleted
 - Status is set to `discontinued` which hides them from vendor views
 - Admin can still see all products/variants regardless of status
+- Admin cannot change the status of a deleted (`discontinued`) variant, as that would cause an inconsistency
 
 ### Stock and Availability
 - A variant is "in stock" when `stock >= minimum_order_quantity`
@@ -317,3 +328,4 @@ If status == 'active':
 - Product names, descriptions, and alt text are sanitized using bleach
 - Allowed tags: `b`, `i`, `u`, `em`, `strong`, `a`, `p`, `ul`, `li`, `br`
 - All other HTML is stripped
+
