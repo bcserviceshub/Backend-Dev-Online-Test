@@ -1,3 +1,6 @@
+
+## Database Design
+
 ### Product Architecture Overview
 
 The product service uses a **Product-Variant architecture** that separates product metadata from actual sellable units. This design enables:
@@ -16,18 +19,18 @@ The product service uses a **Product-Variant architecture** that separates produ
          ▼
 ┌─────────────────┐
 │ ProductVariant  │  ← Actual sellable unit with attributes
-│ (Sellable Unit) │
-└────────┬────────┘
-         │ 1:1
-         ▼
-┌─────────────────┐     ┌─────────────────┐
-│   FixedPrice    │ OR  │   TieredPrice   │  ← Pricing (mutually exclusive)
-└─────────────────┘     └─────────────────┘
-         │                       │
-         └───────────┬───────────┘
-                     ▼
-              ┌─────────────────┐
-              │    Inventory    │  ← Stock management
+│ (Sellable Unit) │ ----------------------------------------------------------
+└────────┬────────┘                                                           |
+         │ 1:1                                                                |
+         ▼                                                                    |
+┌─────────────────┐     ┌─────────────────┐                                   |
+│   FixedPrice    │ OR  │   TieredPrice   │  ← Pricing (mutually exclusive)   | 1:1
+└─────────────────┘     └─────────────────┘                                   |
+         │                       │                                            ▼
+         └───────────┬───────────┘         
+                     ▼                                              ┌──────────────┐     
+              ┌─────────────────┐                                   |  Dimensions  | 
+              │    Inventory    │  ← Stock management               └──────────────┘            
               └─────────────────┘
 ```
 
@@ -46,8 +49,10 @@ The **Product** model represents product metadata - shared information that appl
 | `brand` | ForeignKey | Reference to Brand (defaults to "Generic") |
 | `pricing_model` | CharField | `fixed` or `tiered` - applies to ALL variants (defaults to 'fixed') |
 | `sale_type` | CharField | `wholesale` or `retail` (defaults to retail)|
+| `origin_scope` | CharField | `global`, `ghana-made`, or `foreign` (defaults to 'ghana-made') - indicates product origin |
 | `vendor_id` | UUID | Reference to vendor |
 | `business_name` | CharField | Vendor's business name (denormalized) |
+| `lead_time` | PositiveIntegerfield | Vendor's estimated time for product readiness in days |
 | `status` | CharField | `draft`, `active`, `inactive` (defaults to draft) |
 
 #### Product Status Values
@@ -126,9 +131,9 @@ The **ProductVariant** model represents the actual sellable unit. Each variant h
 The product service supports two mutually exclusive pricing models. The `pricing_model` is set at the **Product level** and applies to ALL variants under that product.
 
 > **Important**:
-> - Once a product has variants with prices, the pricing model CANNOT be changed directly.
-> - For a vendor to change a product's pricing model, it's variants should be deleted before making the change.
-> - A deleted (`discontinued`) variant cannot be reactivated (set to `active`), even by admin, as doing so would cause an inconsistency.
+> - Once a product has non-discontinued variants with prices, the pricing model CANNOT be changed directly.
+> - For a vendor to change a product's pricing model, **all its non-discontinued variants must first be deleted (set to `discontinued`)**.
+> - A deleted (`discontinued`) variant cannot be reactivated (set to `active` or `inactive`), even by admin, as doing so would cause database inconsistencies with attribute/SKU uniqueness constraints.
 > - A vendor can have multiple variants under a product with the same sku/attributes, as long as their statuses are not the same.
 
 #### Fixed Price Model
@@ -217,6 +222,7 @@ Used for wholesale/bulk pricing where price per unit decreases with quantity.
 }
 ```
 
+
 ### Inventory Management
 
 Each variant has a one-to-one relationship with an Inventory record.
@@ -229,12 +235,28 @@ Each variant has a one-to-one relationship with an Inventory record.
 | `low_stock_threshold` | PositiveInt | Alert threshold for low stock |
 | `track_inventory` | Boolean | Whether to track inventory for this variant |
 
-**Constraint**: `low_stock_threshold` must be >= `minimum_order_quantity`
+**Constraints:**
+- `low_stock_threshold` must be >= `minimum_order_quantity`
+
+**MOQ Rules by Sale Type:**
+- **Retail Products**: MOQ must be exactly `1` (cannot be greater than 1)
+- **Wholesale Products**: MOQ must be greater than `1`
 
 **Stock Status Logic:**
 - **In Stock**: `stock >= minimum_order_quantity`
 - **Low Stock**: `stock <= (2 × minimum_order_quantity)`
 - **Out of Stock**: `stock < minimum_order_quantity`
+
+### Dimensions
+Each variant has a one-to-one relationship with an Dimensions.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `variant` | OneToOne | Reference to ProductVariant (primary key) |
+| `lenth` | Decimal(10,2) | Length of variant (defaults to `0.00`) |
+| `width` | Decimal(10,2) | Width of variant (defaults to `0.00`)|
+| `height` | Decimal(10,2) | Height of variant (defaults to `0.00`)|
+| `weight` | Decimal(10,2) | Weight of variant (**required**) |
 
 ### Validation Logic
 
@@ -243,11 +265,13 @@ The product service implements validation at multiple layers for data integrity.
 #### Model-Level Validation (models.py)
 
 **Product Model:**
-- Cannot change `pricing_model` after variants with prices exist
+- Cannot change `pricing_model` after non-discontinued variants with prices exist
+- Products with `origin_scope: global` must have `sale_type: wholesale`
 
 **ProductVariant Model:**
 - `attributes` must be a JSON object with string keys and values
 - Attributes are normalized (lowercase, trimmed) before storage
+- **Attribute consistency**: All variants under a product must have the same set of attribute keys (e.g., if first variant has `{size, color}`, all subsequent variants must also have exactly `{size, color}`)
 - Unique constraint: No duplicate `(vendor_id, product, attribute_signature, status)` combinations
 - Unique constraint: No duplicate `(vendor_id, sku, status)` combinations
 
@@ -269,6 +293,8 @@ The product service implements validation at multiple layers for data integrity.
 **Inventory Model:**
 - `low_stock_threshold` cannot be lower than `minimum_order_quantity`
 - Cannot set MOQ lower than existing tier minimum quantities
+- **Retail products**: MOQ must be exactly 1 (cannot exceed 1)
+- **Wholesale products**: MOQ must be greater than 1
 
 #### Serializer-Level Validation (serializers.py)
 
@@ -301,6 +327,68 @@ If status == 'active':
 
 ---
 
+## Business Rules
+
+This section consolidates the key business rules enforced by the product service.
+
+### Pricing Model Change Rules
+
+| Rule | Description |
+|------|-------------|
+| **Pricing Model Immutability** | A product's `pricing_model` (fixed/tiered) cannot be changed while it has non-discontinued variants with pricing attached |
+| **Changing Pricing Model** | To change a product's pricing model, the vendor must first delete (set to `discontinued`) **all** its non-discontinued variants |
+| **Pricing Consistency** | All variants under a product must use the same pricing model - you cannot mix `FixedPrice` and `TieredPrice` under the same product |
+
+### Minimum Order Quantity (MOQ) Rules
+
+| Sale Type | MOQ Requirement | Description |
+|-----------|-----------------|-------------|
+| **Retail** | MOQ = 1 | Retail products are for individual consumers; MOQ cannot exceed 1 |
+| **Wholesale** | MOQ > 1 | Wholesale products are for bulk purchases; MOQ must be greater than 1 |
+
+### Origin Scope Rules
+
+| Origin Scope | Description | Sale Type Restriction |
+|--------------|-------------|----------------------|
+| **global** | Products imported from international markets | Must be `wholesale` only |
+| **ghana-made** | Products manufactured and sold in Ghana | Can be `retail` or `wholesale` |
+| **foreign** | Products imported from outside but sold in Ghana | Can be `retail` or `wholesale` |
+
+> **Rule**: Products with `origin_scope: global` can only have `sale_type: wholesale`. Global products cannot be sold as retail.
+
+### Variant Attribute Rules
+
+| Rule | Description |
+|------|-------------|
+| **Attribute Key Consistency** | All variants under a product must have the **same set of attribute keys**. For example, if the first variant has `{"size": "large", "color": "red"}`, all subsequent variants must also have exactly `size` and `color` attributes |
+| **No Missing Attributes** | A new variant cannot be missing any attribute keys that exist on other variants of the same product |
+| **No Extra Attributes** | A new variant cannot have attribute keys that don't exist on other variants of the same product |
+
+> **Example**: If a product has a variant with `{"size": "M", "color": "blue"}`, you:
+> - Can add: `{"size": "L", "color": "red"}`
+> - Cannot add: `{"size": "L"}` (missing `color`)
+> - Cannot add: `{"size": "L", "color": "red", "material": "cotton"}` (extra `material`)
+
+### Variant Status Rules
+
+| Rule | Description |
+|------|-------------|
+| **Discontinued Variants Cannot Be Reactivated** | Once a variant is set to `discontinued`, it cannot be changed to `active` or `inactive` status, even by admin. This prevents database inconsistencies with attribute/SKU uniqueness constraints since discontinued variants are excluded from uniqueness checks |
+| **Discontinued Variants Excluded from Constraints** | Discontinued variants do not count against uniqueness constraints, allowing vendors to create new variants with the same attributes/SKU as previously discontinued ones |
+
+### Why These Rules Exist
+
+1. **Pricing Model Immutability**: Changing pricing models mid-lifecycle could break existing cart items, orders, or analytics tied to the old pricing structure.
+
+2. **MOQ by Sale Type**: Retail is consumer-facing (single unit purchases), while wholesale is business-facing (bulk purchases). The MOQ rule enforces this distinction.
+
+3. **Global Origin Scope Restriction**: Global products are imported from international markets which typically involve bulk B2B transactions, not individual consumer sales. Restricting global products to wholesale ensures proper fulfillment logistics and pricing structures for cross-border commerce.
+
+4. **Variant Attribute Consistency**: Ensures a uniform product structure for frontend display and filtering. If variants have inconsistent attribute keys, the UI cannot reliably show attribute selectors (e.g., size/color dropdowns) and comparison becomes impossible.
+
+5. **Discontinued Variant Immutability**: When a variant is discontinued, it's excluded from uniqueness checks (`attribute_signature`, `sku`). If it could be reactivated, it might conflict with a newer variant that was created with the same attributes/SKU after the original was discontinued.
+
+---
 
 ## Notes
 
@@ -310,14 +398,15 @@ If status == 'active':
 - Customers purchase **variants**, not products directly
 
 ### Pricing Model Immutability
-- Once a product has variants with prices attached, the pricing model cannot be changed
+- Once a product has non-discontinued variants with prices attached, the pricing model cannot be changed directly
+- To change the pricing model, all non-discontinued variants must first be deleted (set to `discontinued`)
 - All variants under a product must use the same pricing model (fixed OR tiered)
 
 ### Soft Delete Pattern
 - Products and variants are not permanently deleted
 - Status is set to `discontinued` which hides them from vendor views
 - Admin can still see all products/variants regardless of status
-- Admin cannot change the status of a deleted (`discontinued`) variant, as that would cause an inconsistency
+- **Discontinued variants cannot be reactivated** (status cannot be changed from `discontinued` to `active` or `inactive`), even by admin, as this would cause database inconsistencies with attribute/SKU uniqueness constraints
 
 ### Stock and Availability
 - A variant is "in stock" when `stock >= minimum_order_quantity`
@@ -328,4 +417,3 @@ If status == 'active':
 - Product names, descriptions, and alt text are sanitized using bleach
 - Allowed tags: `b`, `i`, `u`, `em`, `strong`, `a`, `p`, `ul`, `li`, `br`
 - All other HTML is stripped
-
